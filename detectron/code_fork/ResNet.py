@@ -11,12 +11,11 @@ from detectron.utils.net import get_group_gn
 def add_ResNet50_conv4_body(model):
     return add_ResNet_convX_body(model, (3, 4, 6))
 
-
 def add_ResNet50_conv5_body(model):
     return add_ResNet_convX_body(model, (3, 4, 6, 3))
 
 def add_ResNet101_conv4_body(model):
-    return add_ResNet_convX_body(model, (3, 4, 24))
+    return add_ResNet_convX_body(model, (3, 4, 23))
 
 def add_ResNet101_conv5_body(model):
     return add_ResNet_convX_body(model, (3, 4, 23, 3))
@@ -41,13 +40,277 @@ def add_stage(
     """
     Add a ResNet stage to the model by stacking n residual blocks.
     :param model:
+    :param prefix: prefix = res2
+    """
+    for i in range(n):
+        blob_in = add_residual_block(
+        model,
+        '{}_{}'.format(prefix, i),
+            blob_in,
+            dim_in,
+            dim_out,
+            dim_inner,
+            dilation,
+            stride_init,
+            inplace_sum= i < n - 1
+        )
+        dim_in =dim_out
+    return blob_in, dim_in
+
+def add_ResNet_convX_body(model, block_counts):
+    """
+    Add a ResNet body from input data up through the res5 (aka conv5) stage.
+    The final res5/conv5 stage may be optionally excluded (hence convX, where X = 4 or 5).
+    :param model:
+    :param block_counts:
+    :return:
+    """
+    freeze_at = cfg.TRAIN.FREEZE_AT
+    assert freeze_at in [0, 2, 3, 4, 5]
+
+    # add the stem (by default, conv1 and pool1 with bn; can support gn)
+    p, dim_in = globals()[cfg.RESNETS.STEM_FUNC](model, 'data')
+
+    dim_bottleneck = cfg.RESNETS.NUM_GROUPS * cfg.RESNETS.WIDTH_PER_GROUP
+    (n1, n2, n3) = block_counts[:3]
+    s, dim_in = add_stage(model, 'res2', p, n1, dim_in, 256, dim_bottleneck, 1)
+    if freeze_at == 2:
+        model.StopGradient(s, s)
+    s, dim_in = add_stage(
+        model, 'res3', s, n2, dim_in, 512, dim_bottleneck*2, 1
+    )
+    if freeze_at == 3:
+        model.StopGradient(s, s)
+    s, dim_in = add_stage(
+        model, 'res4', s, n3, dim_in, 1024, dim_bottleneck * 4, 1
+    )
+    if freeze_at == 4 :
+        model.StopGradient(s, s)
+    if len(block_counts) == 4:
+        n4 = block_counts[3]
+        s, dim_in = add_stage(
+            model, 'res5', s, n4, dim_in, 2048, dim_bottleneck * 8,
+            cfg.RESNETS.RESS_DILATION
+        )
+        if freeze_at == 5:
+            model.StopGradient(s, s)
+        return s, dim_in, 1. / 32. * cfg.RESNETS.RESS_DILATION
+    else:
+        return s, dim_in, 1. / 16.
+
+
+def add_ResNet_roi_conv5_head(model, blob_in, dim_in, spatial_scale):
+    """Adds  an ROI feature transformation followed by a res5/conv5 head applied to each ROI."""
+    model.RoIFeatureTransform(
+        blob_in,
+        'pools',
+        blob_rois='rois',
+        method=cfg.FAST_RCNN.ROI_XFORM_METHOD,
+        resolution=cfg.FAST_RCNN.ROI_XFORM_RESOLUTION,
+        sampling_ratio=cfg.FAST_RCNN.ROI_XFORM_SAMPLING_RATIO,
+        spatial_scale= spatial_scale
+    )
+    dim_bottleneck = cfg.RESNETS.NUM_GROUPS * cfg.RESNETS.WIDTH_PER_GROUP
+    stride_init = int(cfg.FAST_RCNN.ROI_XFORM_RESOLUTION / 7)
+    s, dim_in =add_stage(
+        model, 'res5', 'pools5', 3, dim_in, 2048, dim_bottleneck * 8, 1, stride_init
+    )
+
+
+def add_residual_block(
+        model,
+        prefix,
+        blob_in,
+        dim_in,
+        dim_out,
+        dim_inner,
+        dilation,
+        stride_init=2,
+        inplace_sum=False
+):
+    """
+    Add a residual block to the model.
+    :param model:
     :param prefix:
     :param blob_in:
-    :param n:
     :param dim_in:
     :param dim_out:
     :param dim_inner:
     :param dilation:
     :param stride_init:
+    :param inplace_sum:
     :return:
     """
+    stride = stride_init if ( dim_in != dim_out and dim_in != 64 and dilation ==1) else 1
+
+    tr = globals()[cfg.RESNETS.TRANS_FUNC](
+        model, blob_in, dim_in, dim_out, stride, prefix, dim_inner,
+        group=cfg.RESNETS.NUM_GROUPS, dilation=dilation
+    )
+
+    # sum-> ReLU
+    # shortcut functions: by default using bn; support gn
+    add_shortcut = globals()[cfg.RESNETS.SHORTCUT_FUNC]
+    sc = add_shortcut(model, prefix, blob_in, dim_in, dim_in, dim_out, stride)
+    if inplace_sum:
+        s = model.net.Sum([tr, sc], tr)
+    else:
+        s = model.net.Sum([tr, sc], prefix + '_sum')
+    return model.Relu(s, s)
+
+# Various shortcuts (may expand and my condider a new helper)
+
+def basic_bn_shortcut(model, prefix, blob_in, dim_in, dim_out, stride):
+    if dim_in == dim_out :
+        return blob_in
+
+    c = model.Conv(
+        blob_in,
+        prefix + '_branch1',
+        dim_in,
+        dim_out,
+        kernel=1,
+        stride=stride,
+        no_bias=1
+    )
+    return model.AffineChannel(c, prefix + '_branch1_bn', dim=dim_out)
+
+def basic_gn_shortcut(model, prefix, blob_in, dim_in, dim_out, stride):
+    if dim_in == dim_out:
+        return blob_in
+    # output name is prefix + '_branch1_gn'
+    return model.ConvGN(
+        blob_in,
+        prefix + '_branch1',
+        dim_in,
+        dim_out,
+        kernel=1,
+        group_gn=get_group_gn(dim_out),
+        stride=stride,
+        pad=0,
+        group=1,
+    )
+
+# various stems
+
+def basic_bn_stem(model, data,  **kwargs):
+    dim = 64
+    p = model.Conv(data, 'conv1', 3, dim, 7, pad=3, stride=2, no_bias=1)
+    p = model.AffineChannel(p, 'res_conv1_bn', dim=dim, inplace=True)
+    p = model.Relu(p, p)
+    p = model.MaxPool(p, 'pool1', kernel=3, pad=1, stride=2)
+    return p, dim
+
+def basic_gn_stem(model, data, **kwargs):
+    dim = 64
+    p = model.ConvGN(
+        data, 'conv1', 3, dim, 7, group_gn=get_group_gn(dim), pad=3, stride=2
+    )
+    p = model.Relu(p, p)
+    p = model.MaxPool(p, 'pool1', kernel=3, pad=1, stride=2)
+    return p, dim
+
+# Various transformations
+
+def bottleneck_transformation(
+        model, blob_in, dim_in, dim_out, stride, prefix, dim_inner, dilation=1, group=1
+):
+    (str1x1, str3x3) = (stride, 1) if cfg.RESNETS.STRIDE_1x1 else (1, stride)
+
+    # conv 1x1 -> BN -> ReLU
+    cur = model.ConvAffine(
+        blob_in,
+        prefix + '_branch2a',
+        dim_in,
+        dim_inner,
+        kernel=1,
+        stride=str1x1,
+        pad=0,
+        inplace=True
+    )
+
+    # conv 3x3 ->BN -> ReLU
+    cur = model.ConvAffine(
+        cur,
+        prefix + '_branch2b',
+        dim_inner,
+        dim_inner,
+        kernel=3,
+        stride=str3x3,
+        pad=1 * dilation,
+        dilation=dilation,
+        group=group,
+        inplace=True
+    )
+    cur = model.Relu(cur, cur)
+
+    # conv 1x1 -> BN (no ReLU)
+    cur = model.ConvAffine(
+        cur,
+        prefix + '_branch2c',
+        dim_inner,
+        dim_out,
+        kernel=1,
+        stride=1,
+        pad=0,
+        inplace=False
+    )
+    return cur
+
+
+def bottleneck_gn_transformation(
+    model,
+    blob_in,
+    dim_in,
+    dim_out,
+    stride,
+    prefix,
+    dim_inner,
+    dilation=1,
+    group=1
+):
+    """Add a bottleneck transformation with GroupNorm to the model."""
+    # In original resnet, stride=2 is on 1x1.
+    # In fb.torch resnet, stride=2 is on 3x3.
+    (str1x1, str3x3) = (stride, 1) if cfg.RESNETS.STRIDE_1X1 else (1, stride)
+
+    # conv 1x1 -> GN -> ReLU
+    cur = model.ConvGN(
+        blob_in,
+        prefix + '_branch2a',
+        dim_in,
+        dim_inner,
+        kernel=1,
+        group_gn=get_group_gn(dim_inner),
+        stride=str1x1,
+        pad=0,
+    )
+    cur = model.Relu(cur, cur)
+
+    # conv 3x3 -> GN -> ReLU
+    cur = model.ConvGN(
+        cur,
+        prefix + '_branch2b',
+        dim_inner,
+        dim_inner,
+        kernel=3,
+        group_gn=get_group_gn(dim_inner),
+        stride=str3x3,
+        pad=1 * dilation,
+        dilation=dilation,
+        group=group,
+    )
+    cur = model.Relu(cur, cur)
+
+    # conv 1x1 -> GN (no ReLU)
+    cur = model.ConvGN(
+        cur,
+        prefix + '_branch2c',
+        dim_inner,
+        dim_out,
+        kernel=1,
+        group_gn=get_group_gn(dim_out),
+        stride=1,
+        pad=0,
+    )
+    return cur
