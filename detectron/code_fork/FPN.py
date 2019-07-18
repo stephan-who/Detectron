@@ -67,13 +67,101 @@ def add_fpn(model, fpn_level_info):
     # that are even higher/coarser than the starting level.
     fpn_dim = cfg.FPN.DIM
     min_level, max_level = get_min_max_levels()
+    num_backbone_stages = (
+        len(fpn_level_info.blobs) - (min_level - LOWEST_BACKONE_LVL)
+    )
+    lateral_input_blobs = fpn_level_info.blobs[:num_backbone_stages]
+    output_blobs = [
+        'fpn_inner_{}'.format(s)
+        for s in fpn_level_info.blobs[:num_backbone_stages]
+    ]
+    fpn_dim_lateral = fpn_level_info.dims
+    xavier_fill = ('XavierFill, {}')
 
+    # For the coarsest bnackbone level:1x1 conv only seeds recursion
+    if cfg.FPN.USE_GN:
+        #
+        c = model.model.ConGN(
+            lateral_input_blobs[0],
+            output_blobs[0], # note :this ia s prefix
+            dim_in=fpn_dim_lateral[0],
+            dim_out=fpn_dim,
+            group_gn=get_group_gn(fpn_dim),
+            kernel=1,
+            pad=0,
+            stride=1,
+            weight_init=xavier_fill,
+            bias_init=const_fill(0.0)
+        )
+        output_blobs[0] = c #
+    else:
+        model.Conv(
+            lateral_input_blobs[0],
+            output_blobs[0],
+            dim_in=fpn_dim_lateral[0],
+            dim_out=fpn_dim,
+            kernel=1,
+            pad=0,
+            stride=1,
+            weight_init=xavier_fill,
+            bias_init=const_fill(0.0)
+        )
+    #
+    # Step 1: recursively build down starting from the coarsest backbone level
+    #
 
+    # For other levels add top-down and lateral connections
+    for i in range(num_backbone_stages - 1):
+        add_topdown_lateral_module(
+            model,
+            output_blobs[i],
+            lateral_input_blobs[i + 1],
+            output_blobs[i+ 1],
+            fpn_dim,
+            fpn_dim_lateral[i + 1]
+        )
 
-def add_topdown_lateral_module():
+    # Post-hoc scale-specific 3x3 convs
+    blobs_fpn = []
+    spatial_scales = []
+
+def add_topdown_lateral_module(model, fpn_top, fpn_lateral, fpn_bottom, dim_top, dim_lateral):
     """Add a top-down lateral module."""
     # Lateral 1x1 conv
-
+    if cfg.FPN.USE_GN:
+        # use GroupNorm
+        lat = model.ConvGN(
+            fpn_lateral,
+            fpn_bottom + '_lateral',
+            dim_in=dim_lateral,
+            dim_out=dim_top,
+            group_gn=get_group_gn(dim_top),
+            kernel=1,
+            pad=0,
+            stride=1,
+            weight_init=(const_fill(0.0) if cfg.FPN.ZERO_INIT_LATERAL
+                         else ('XavierFill', {})),
+            bias_init=const_fill(0.0)
+        )
+    else:
+        lat = model.Conv(
+            fpn_lateral,
+            fpn_bottom + '_lateral',
+            dim_in=dim_lateral,
+            dim_out=dim_top,
+            kernel=1,
+            pad=0,
+            stride=1,
+            weight_init=(
+                const_fill(0.0)
+                if cfg.FPN.ZERO_INIT_LATERAL else ('XavierFill', {})
+            ),
+            bias_init=const_fill(0.0)
+        )
+    # Top-down 2x upsampling
+    td = model.net.UpsampleNearest(fpn_top, fpn_bottom + '_topdown', scale=2)
+    # Sum lateral and top-down
+    model.net.Sum([lat, td], fpn_bottom)
 
 
 def get_min_max_levels():
@@ -83,3 +171,8 @@ def get_min_max_levels():
     max_level = HIGHEST_BACKONE_LVL
     if cfg.FPN.MULTILEVEL_RPN and not cfg.FPN.MULTILEVEL_ROIS:
         max_level = cfg.FPN.RPN_MAX_LEVEL
+        min_level = cfg.FPN.RPN_MIN_LEVEL
+    if not cfg.FPN.MULTILEVEL_RPN and cfg.FPN.MULTILEVEL_ROIS:
+        max_level = cfg.FPN.ROI_MAX_LEVEL
+        min_level = cfg.FPN.ROI_MIN_LEVEL
+    return min_level, max_level
