@@ -37,3 +37,49 @@ def add_fpn_ResNet50_conv5_P2only_body(model):
 
     )
 
+def add_fpn_ResNet101_conv5_P2only_body(model):
+    return add_fpn_onto_conv_body(
+
+    )
+
+
+# Functions for bolting FPN onto a backone architectures
+def add_fpn_onto_conv_body(
+        model, conv_body_func, fpn_level_info_func, P2only=False
+):
+    """Add the specified conv body to the model and then add FPN levels to it."""
+    # Note: blobs_conv is in reversed order:[fpn5, fpn4, fpn3, fpn2]
+    # similarly for dims_conv: [2048, 1024, 512, 256]
+    # similarly fo spatial_scales_fpn: [1/32, 1/16, 1/8, 1/4]
+
+    conv_body_func(model)
+    blobs_fpn, dim_fpn, spatial_scales_fpn = add_fpn(
+        model, fpn_level_info_func()
+    )
+
+
+
+def add_fpn(model, fpn_level_info):
+    """Add FPN connections base on the model described in the FPN paper."""
+    # FPN levels are built starting from the highest/coarest level of the
+    # backbone (usually "conv5"). First we build down, recursively constructing
+    # lower/finer resolution FPN levels. Then we build up, constructing levels
+    # that are even higher/coarser than the starting level.
+    fpn_dim = cfg.FPN.DIM
+    min_level, max_level = get_min_max_levels()
+
+
+
+def add_topdown_lateral_module():
+    """Add a top-down lateral module."""
+    # Lateral 1x1 conv
+
+
+
+def get_min_max_levels():
+    """The min and max FPN levels required for supporting RPN and/or RoI
+    transform operations on multiple FPN levels."""
+    min_level = LOWEST_BACKONE_LVL
+    max_level = HIGHEST_BACKONE_LVL
+    if cfg.FPN.MULTILEVEL_RPN and not cfg.FPN.MULTILEVEL_ROIS:
+        max_level = cfg.FPN.RPN_MAX_LEVEL
