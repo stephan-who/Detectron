@@ -273,6 +273,7 @@ def get_min_max_levels():
 
 
 def add_fpn_rpn_outputs(model, blobs_in, dim_in, spatial_scales):
+    """Add FPN on FPN specific outputs."""
     num_anchors = len(cfg.FPN.RPN_ASPECT_RATIOS)
     dim_out = dim_in
 
@@ -285,9 +286,9 @@ def add_fpn_rpn_outputs(model, blobs_in, dim_in, spatial_scales):
         slvl = str(lvl)
 
         if lvl ==k_min:
-            #  # Create conv ops with randomly initialized weights and
-            #             # zeroed biases for the first FPN level; these will be shared by
-            #             # all other FPN levels
+            #  Create conv ops with randomly initialized weights and
+            #  zeroed biases for the first FPN level; these will be shared by
+            #  all other FPN levels
             # RPN hidden representation
             conv_rpn_fpn = model.Conv(
                 bl_in,
@@ -342,11 +343,129 @@ def add_fpn_rpn_outputs(model, blobs_in, dim_in, spatial_scales):
             )
             model.Relu(conv_rpn_fpn, conv_rpn_fpn)
             # Proposal classification scores
+            rpn_cls_logits_fpn = model.ConvShared(
+                conv_rpn_fpn,
+                'rpn_cls_logits_fpn' + slvl,
+                dim_in,
+                num_anchors,
+                kernel=1,
+                pad=0,
+                stride=1,
+                weight='rpn_cls_logits_fpn' + sk_min + '_w',
+                bias='rpn_cls_logits-fpn' + sk_min + '_b'
+            )
+            # Proposal bbox regression deltas
+            rpn_bbox_pred_fpn = model.ConvShared(
+                conv_rpn_fpn,
+                'rpn_bbox_pred_fpn' + slvl,
+                dim_in,
+                4 * num_anchors,
+                kernel=1,
+                pad=0,
+                stride=1,
+                weight='rpn_bbox_pred_fpn' + sk_min + '_w',
+                bias='rpn_bbox_pred_fpn' + sk_min + '_b'
+            )
+
+        if not model.train or cfg.MODEL.FASTER_RCNN:
+            # Proposals are needed during:
+            # 1) inference (== not model.train) for RPN only and Faster R-CNN
+            # OR
+            # 2) training for Faster R-CNN
+            # Otherwise (== training for RPN only), proposals are not needed.
+            lvl_anchors = generate_anchors(
+                stride=2.**lvl,
+                sizes=(cfg.FPN.RPN_ANCHOR_START_SIZE * 2.**(lvl -k_min),),
+                aspect_ratios=cfg.FPN.RPN_ASPECT_RATIOS
+            )
+            rpn_cls_probs_fpn = model.net.Sigmoid(
+                rpn_cls_logits_fpn, 'rpn_cls_probs_fpn' + slvl
+            )
+            model.GenerateProposal(
+                [rpn_cls_probs_fpn, rpn_bbox_pred_fpn, 'im_info'],
+                ['rpn_rois_fpn' + slvl, 'rpn_roi_probs_fpn' + slvl],
+                anchors=lvl_anchors,
+                spatial_scales=sc
+            )
 
 
+def add_fpn_rpn_losses(model):
+    """Add RPN on FPN specific losses."""
+    loss_gradients = {}
+    for lvl in range(cfg.FPN.RPN_MIN_LEVEL, cfg.FPN.RPN_MAX_LEVEL + 1):
+        slvl = str(lvl)
+        # Spatially narrow the full-sized RPN label arrays to match the feature map
+        # shape
+        model.net.SpatialNarrowAs(
+            ['rpn_labels_int32_wide_fpn' + slvl, 'rpn_cls_logits_fpn' + slvl],
+            'rpn_labels_int32_fpn' + slvl
+        )
+        for key in ('targets', 'inside_weights', 'outside_weights'):
+            model.net.SpatialNarrowAs(
+                [
+                    'rpn_bbox_' + key + '_wide_fpn' +slvl,
+                    'rpn_bbox_pred_fpn' + slvl
+                ],
+                'rpn_bbox_' + key + '_fpn' + slvl
+            )
+        loss_rpn_cls_fpn = model.net.SigmoidCrossEntropyLoss(
+            ['ron_cls_logits_fpn' + slvl, 'rpn_labels_int32_fpn' + slvl],
+            'loss_rpn_cls_fpn' + slvl,
+            normalize=0,
+            scale=(
+                model.GetLossScale() / cfg.TRAIN.RPN_BATCH_SIZE_PER_IM /
+                cfg.TRAIN.IMS_PER_BATCH
+            )
+        )
+        # Normalization by (1) RPN_BATCH_SIZE_PER_IM and (2) IMS_PER_BATCH is
+        # handled by (1) setting bbox outside weights and (2) SmoothL1Loss
+        # normalizes by IMS_PER_BATCH
+        loss_rpn_bbox_fpn = model.net.SmoothL1Loss(
+            [
+                'rpn_bbox_pred_fpn' + slvl, 'rpn_bbox_targets_fpn' + slvl,
+                'rpn_bbox_inside_weights_fpn' + slvl,
+                'rpn_bbox_outside_weights_fpn' + slvl
+            ],
+            'loss_rpn_bbox_fpn' + slvl,
+            beta=1. / 9.,
+            scale=model.GetLossScale()
+        )
+        loss_gradients.update(
+            blob_utils.get_loss_gradients(model, [loss_rpn_cls_fpn, loss_rpn_bbox_fpn])
+        )
+        model.AddLosses(['loss_rpn_cls_fpn' + slvl, 'loss_rpn_bbox_fpn' + slvl])
+    return loss_gradients
 
 
 # Helper functions for working with multilevel FPN RoIs
+
+def map_rois_to_fpn_levels(rois, k_min, k_max):
+    # Compute level ids
+    s = np.sqrt(box_utils.boxes_area(rois))
+    s0 = cfg.FPN.ROI_CANONICAL_SCALE #
+    lvl0 = cfg.FPN.ROI_CANONICAL_level
+    #
+    target_lvls = np.floor(lvl0 + np.log2(s /s0 + 1e-6))
+    target_lvls = np.clip(target_lvls, k_min, k_max)
+    return target_lvls
+
+
+def add_multilevel_roi_blobs(
+        blobs, blob_prefix, rois, target_lvls, lvl_min, lvl_max):
+    """Add RoI blobs for multiple FPN levels to the blobs dict."""
+    rois_idx_order = np.empty((0, ))
+    rois_stacked = np.zeros((0, 5), dtype=np.float32)
+    for lvl in range(lvl_min, lvl_max + 1):
+        idx_lvl = np.where(target_lvls == lvl)[0]
+        blobs[blob_prefix + '_fpn' + str(lvl)] = rois[idx_lvl, :]
+        rois_idx_order = np.concatenate((rois_idx_order, idx_lvl))
+        rois_stacked = np.vstack(
+            [rois_stacked, blobs[blob_prefix + '_fpn' + str(lvl)]]
+        )
+    rois_idx_restore = np.argsort(rois_idx_order).astype(np.int32, copy=False)
+    blobs[blob_prefix + '_idx_restore_int32'] = rois_idx_restore
+    # Sanity check that restore order is correct
+    assert (rois_stacked[rois_idx_restore] == rois).all()
 
 
 # FPN level info for stages 5, 4, 3, 2 for select models ()
